@@ -6,6 +6,7 @@ from datetime import timedelta
 from datetime import datetime
 import logging
 import json
+import os
 
 # This is to handle BQ returning a datatime function, not actual string we can put into Splunk
 def dconvert(o):
@@ -30,23 +31,17 @@ def export_billing(event, context):
     else:
         data = ''
 
-    if 'attributes' not in event or event['attributes'] == None:
-        logging.error('no attributes passed to cloud function')
-        return
-    else:
-        attributes = event['attributes']
-
     try:
-        BQ_PROJECT_ID=attributes['bq_project_id']
-        BQ_DATASET=attributes['bq_dataset']
-        BQ_TABLE=attributes['bq_table']
-        BILLING_BUCKET_NAME=attributes['billing_bucket_name']
+        BQ_PROJECT_ID=os.environ['BQ_PROJECT_ID']
+        BQ_DATASET=os.environ['BQ_DATASET']
+        BQ_TABLE=os.environ['BQ_TABLE']
+        BILLING_BUCKET_NAME=os.environ['BILLING_BUCKET_NAME']
     except KeyError as k:
-        logging.error("attribute: {} is missing".format(str(k)))
+        logging.error("environment variable: {} is missing".format(str(k)))
         return
 
     try:
-        PREVIOUS_DAYS_TO_QUERY=attributes['previous_days_to_query']
+        PREVIOUS_DAYS_TO_QUERY=os.environ['PREVIOUS_DAYS_TO_QUERY']
     except KeyError as k:
         # if not specified take data of one day by default
         PREVIOUS_DAYS_TO_QUERY='1'
