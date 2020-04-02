@@ -34,10 +34,17 @@ def export_billing(event, context):
         BQ_DATASET=attributes['bq_dataset']
         BQ_TABLE=attributes['bq_table']
         BILLING_BUCKET_NAME=attributes['billing_bucket_name']
-        print("bq dataset:{}.{}.{}, bucket: {}".format(BQ_PROJECT_ID,BQ_DATASET,BQ_TABLE,BILLING_BUCKET_NAME))
     except KeyError as k:
         logging.error("attribute: {} is missing".format(str(k)))
         return
+
+    try:
+        PREVIOUS_DAYS_TO_QUERY=attributes['previous_days_to_query']
+    except KeyError as k:
+        # if not specified take data of one day by default
+        PREVIOUS_DAYS_TO_QUERY='1'
+
+    print("bq dataset: {}.{}.{}, days to query: {}, bucket: {}".format(BQ_PROJECT_ID,BQ_DATASET,BQ_TABLE,PREVIOUS_DAYS_TO_QUERY,BILLING_BUCKET_NAME))
 
     # Construct a BigQuery client object.
     client = bigquery.Client()
@@ -50,18 +57,18 @@ def export_billing(event, context):
           TO_JSON_STRING(system_labels) AS system_labels, location, export_time,
           cost, currency, currency_conversion_rate, usage, invoice, cost_type, credits
         FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}`
-        WHERE DATE(_PARTITIONTIME) = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
-    """.format(BQ_PROJECT_ID=BQ_PROJECT_ID,BQ_DATASET=BQ_DATASET,BQ_TABLE=BQ_TABLE)
+        WHERE DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL {PREVIOUS_DAYS_TO_QUERY} DAY) AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+    """.format(BQ_PROJECT_ID=BQ_PROJECT_ID,BQ_DATASET=BQ_DATASET,BQ_TABLE=BQ_TABLE,PREVIOUS_DAYS_TO_QUERY=PREVIOUS_DAYS_TO_QUERY)
 
     # Make an API request.
     query_job = client.query(query)
     records = [str(dict(row)) for row in query_job]
     records_dump = '\n'.join(records)
-
     # Construct a Storage client object.
     storage_client = storage.Client()
     bucket = storage_client.get_bucket(BILLING_BUCKET_NAME)
     yesterday_date = date.today() - timedelta(days = 1)
+    filename = str(yesterday_date) + '_' + PREVIOUS_DAYS_TO_QUERY
     # Create a file in the bucket and store the data.
-    blob = bucket.blob(str(yesterday_date))
+    blob = bucket.blob(filename)
     blob.upload_from_string(records_dump)
