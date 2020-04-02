@@ -3,7 +3,14 @@ from google.cloud import bigquery
 from google.cloud import storage
 from datetime import date
 from datetime import timedelta
+from datetime import datetime
 import logging
+import json
+
+# This is to handle BQ returning a datatime function, not actual string we can put into Splunk
+def dconvert(o):
+    if isinstance(o, datetime):
+        return o.__str__()
 
 def export_billing(event, context):
     """Background Cloud Function to be triggered by Pub/Sub.
@@ -62,7 +69,7 @@ def export_billing(event, context):
 
     # Make an API request.
     query_job = client.query(query)
-    records = [str(dict(row)) for row in query_job]
+    records = [json.dumps(dict(row), default = dconvert) for row in query_job]
     records_dump = '\n'.join(records)
     # Construct a Storage client object.
     storage_client = storage.Client()

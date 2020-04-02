@@ -1,27 +1,27 @@
 # billing_export_bq_gcs
 This is a POC for exporting Google Cloud billing data to GCS after processing it in BigQuery.
 
-### requirements
+### Requirements
 1. Existing BigQuery dataset that has your billing data
 2. Existing bucket where you wish to send your data
 
-### setps
+### Steps
 
 1. Create the pubsub topic(billing)
 
 ```shell
-gcloud pubsub topics create billing
+gcloud pubsub topics create billing_export
 ```
 
-2. Create a Cloud function that subscribes to PUB/SUB topic(billing)
+2. Create a Cloud function that subscribes to PUB/SUB topic(billing_export)
 
 `NOTE`: the Cloud function ships all the billing data of the day before the current date when the function was run from the BigQuery dataset to a file inside a bucket you specify. Also, you can specify a param to make it query more than one day. For example to query the last 30 days not including current day you can pass in attribute `(previous_days_to_query='30')` as shown later in step 3.
 
 ```shell
-gcloud functions deploy export_billing --runtime python37 --trigger-topic billing
+gcloud functions deploy export_billing --runtime python37 --trigger-topic billing_export
 ```
 
-3. publish a message to the billing topic to trigger the cloud function and test everything is working. Make sure to change the attributes to match your current environment:
+3. Publish a message to the billing topic to trigger the cloud function and test everything is working. Make sure to change the attributes to match your current environment:
 `NOTE`: if you trigger the cloud function multiple times, it will replace the billing export file for the day before with the latest billing data in the BigQuery dataset.
 
 ```shell
