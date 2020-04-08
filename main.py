@@ -8,29 +8,15 @@ import logging
 import json
 import os
 
-# This is to handle BQ returning a datatime function, not actual string we can put into Splunk
-def dconvert(o):
-    if isinstance(o, datetime):
-        return o.__str__()
-
 def export_billing(event, context):
-    """Background Cloud Function to be triggered by Pub/Sub.
-    Args:
-         event (dict):  The dictionary with data specific to this type of
-         event. The `data` field contains the PubsubMessage message. The
-         `attributes` field will contain custom attributes if there are any.
-         context (google.cloud.functions.Context): The Cloud Functions event
-         metadata. The `event_id` field contains the Pub/Sub message ID. The
-         `timestamp` field contains the publish time.
-    """
-    print("""This Function was triggered by messageId {} published at {}
-    """.format(context.event_id, context.timestamp))
-
+    PREVIOUS_DAYS_TO_QUERY='1' # Default unless you pass a number to the pubsub topic
+    BILLING_TEMP_TABLE="billing_export_temp"
     if 'data' in event:
         data = base64.b64decode(event['data']).decode('utf-8')
-    else:
-        data = ''
-
+        if data.isdigit():
+            if int(data) > 1:
+                PREVIOUS_DAYS_TO_QUERY=data
+                print("Querying data back {} days".format(PREVIOUS_DAYS_TO_QUERY))
     try:
         BQ_PROJECT_ID=os.environ['BQ_PROJECT_ID']
         BQ_DATASET=os.environ['BQ_DATASET']
@@ -40,37 +26,76 @@ def export_billing(event, context):
         logging.error("environment variable: {} is missing".format(str(k)))
         return
 
-    try:
-        PREVIOUS_DAYS_TO_QUERY=os.environ['PREVIOUS_DAYS_TO_QUERY']
-    except KeyError as k:
-        # if not specified take data of one day by default
-        PREVIOUS_DAYS_TO_QUERY='1'
+    print("Importing from BQ dataset: {}.{}.{}. Exporting to bucket: {}".format(BQ_PROJECT_ID,BQ_DATASET,BQ_TABLE,BILLING_BUCKET_NAME))
+    yesterday_date = date.today() - timedelta(days = 1)
+    filename = "{}_{}".format(str(yesterday_date), str(PREVIOUS_DAYS_TO_QUERY))
 
-    print("bq dataset: {}.{}.{}, days to query: {}, bucket: {}".format(BQ_PROJECT_ID,BQ_DATASET,BQ_TABLE,PREVIOUS_DAYS_TO_QUERY,BILLING_BUCKET_NAME))
-
-    # Construct a BigQuery client object.
+    destination_uri = "gs://{}/{}".format(BILLING_BUCKET_NAME, filename + "-*.csv") # need wildcard as export shards on > 1 GB
     client = bigquery.Client()
 
     query = """
-        SELECT billing_account_id, service, sku, usage_start_time,
-          usage_end_time, project.id AS project_id, project.name AS project_name,
-          project.ancestry_numbers AS project_ancestry_numbers,
-          TO_JSON_STRING(project.labels) AS project_labels, TO_JSON_STRING(labels) AS labels,
-          TO_JSON_STRING(system_labels) AS system_labels, location, export_time,
-          cost, currency, currency_conversion_rate, usage, invoice, cost_type, credits
-        FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}`
-        WHERE DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL {PREVIOUS_DAYS_TO_QUERY} DAY) AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+        CREATE OR REPLACE TABLE {BQ_DATASET}.billing_export_temp AS (
+            SELECT billing_account_id,
+                service.id          AS service_id,
+                service.description AS service_description,
+                sku.id              AS sku_id,
+                sku.description     AS sku_description,
+                usage_start_time,
+                usage_end_time,
+                project.id                     AS project_id,
+                project.NAME                   AS project_name,
+                project.ancestry_numbers       AS project_ancestry_numbers,
+                to_json_string(project.labels) AS project_labels,
+                to_json_string(labels)         AS labels,
+                to_json_string(system_labels)  AS system_labels,
+                location.location              AS location,
+                location.country               AS location_country,
+                location.region                AS location_region,
+                location.zone                  AS location_zone,
+                export_time,
+                cost,
+                currency,
+                currency_conversion_rate,
+                usage.amount                  AS usage_amount,
+                usage.unit                    AS usage_unit,
+                usage.amount_in_pricing_units AS usage_amount_in_pricing_units,
+                usage.pricing_unit            AS usage_pricing_unit,
+                to_json_string(credits)       AS credits,
+                invoice.month                 AS invoice_month,
+                cost_type
+            FROM   {BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}
+            WHERE  date(_partitiontime) BETWEEN date_sub(CURRENT_DATE(), interval {PREVIOUS_DAYS_TO_QUERY} day) AND date_sub(CURRENT_DATE(), interval 1 day))
     """.format(BQ_PROJECT_ID=BQ_PROJECT_ID,BQ_DATASET=BQ_DATASET,BQ_TABLE=BQ_TABLE,PREVIOUS_DAYS_TO_QUERY=PREVIOUS_DAYS_TO_QUERY)
 
-    # Make an API request.
     query_job = client.query(query)
-    records = [json.dumps(dict(row), default = dconvert) for row in query_job]
-    records_dump = '\n'.join(records)
-    # Construct a Storage client object.
+    results = query_job.result()
+
+    dataset_ref = client.dataset(BQ_DATASET)
+    table_ref = dataset_ref.table(BILLING_TEMP_TABLE)
+
+    extract_job = client.extract_table(
+        table_ref,
+        destination_uri,
+        location="US",
+    )  # Extract into < 1 GB objects
+    extract_job.result()  # Waits for job to complete.
+
+    # delete table now that we're done
+    client.delete_table(table_ref)
+
+    # Connect to GCS and compose all the blobs into a single object then clean up temp objects
     storage_client = storage.Client()
     bucket = storage_client.get_bucket(BILLING_BUCKET_NAME)
-    yesterday_date = date.today() - timedelta(days = 1)
-    filename = str(yesterday_date) + '_' + PREVIOUS_DAYS_TO_QUERY
-    # Create a file in the bucket and store the data.
-    blob = bucket.blob(filename)
-    blob.upload_from_string(records_dump)
+    blobs = list(storage_client.list_blobs(
+        BILLING_BUCKET_NAME, prefix=filename+"-", delimiter='/'
+    ))
+
+    final_name = filename + '.csv'
+
+    if len(blobs) > 1: # Check for compose or rename required
+        blob = bucket.blob(final_name)
+        blob.compose(blobs)
+        for blob in blobs:
+            blob.delete()
+    else:
+        new_blob = bucket.rename_blob(blobs.pop(),final_name)
